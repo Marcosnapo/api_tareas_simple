@@ -1,0 +1,21 @@
+# Directorios de entorno virtual
+venv/
+env/
+
+# Archivos compilados de Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Archivos de base de datos SQLite (si usamos SQLite)
+*.db
+*.sqlite
+*.sqlite3
+
+# Archivos de configuración sensibles (tokens, claves, variables de entorno)
+.env
+.flaskenv
+
+# Archivos de logs
+*.log
