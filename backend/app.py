@@ -1,106 +1,149 @@
 import os
+from datetime import timedelta
 from flask import Flask, request, jsonify
 from flask_sqlalchemy import SQLAlchemy
-from datetime import datetime
+from flask_migrate import Migrate
+from flask_cors import CORS
+from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
+from werkzeug.security import generate_password_hash, check_password_hash
 
-# --- 1. Configuración de la aplicación Flask ---
 app = Flask(__name__)
 
-# Configuración de la base de datos
-# DATABASE_URL = "postgresql://usuario:contraseña@host:puerto/nombre_base_de_datos"
-# ¡IMPORTANTE! Reemplaza 'marcosnapo' con tu usuario de DB y 'tu_contrasena_segura' con tu contraseña de DB
-# El puerto por defecto es 5432
-DATABASE_URL = os.environ.get('DATABASE_URL', 'postgresql://marcosnapo:123456@localhost:5432/api_tareas_db')
-
+# Configuración de la Base de Datos
+# Si la variable de entorno no está definida, usa una por defecto (para desarrollo local)
+# ¡Asegúrate de que la contraseña aquí coincida con la que estableciste en PostgreSQL!
+DATABASE_URL = os.environ.get('DATABASE_URL', 'postgresql://postgres:123456@localhost:5432/api_tareas_db')
 app.config['SQLALCHEMY_DATABASE_URI'] = DATABASE_URL
-app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False # Desactiva el seguimiento de modificaciones para reducir el uso de memoria
-db = SQLAlchemy(app)
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
-# --- 2. Modelo de la Base de Datos (Tabla de Tareas) ---
-class Task(db.Model):
+# Configuración de JWT
+# ¡Cambiar por una clave real en producción! Usa una variable de entorno.
+app.config['JWT_SECRET_KEY'] = os.environ.get('JWT_SECRET_KEY', 'super-secret-jwt-key')
+app.config['JWT_ACCESS_TOKEN_EXPIRES'] = timedelta(hours=24) # Los tokens expiran en 24 horas
+
+db = SQLAlchemy(app)
+migrate = Migrate(app, db)
+CORS(app) # Habilita CORS para todas las rutas
+jwt = JWTManager(app) # Inicializa JWTManager con la aplicación
+
+# Modelos
+class User(db.Model):
     id = db.Column(db.Integer, primary_key=True)
-    title = db.Column(db.String(100), nullable=False)
-    description = db.Column(db.Text, nullable=True)
-    completed = db.Column(db.Boolean, default=False)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    username = db.Column(db.String(80), unique=True, nullable=False)
+    password_hash = db.Column(db.String(256), nullable=False)
+    tasks = db.relationship('Task', backref='author', lazy=True) # Relación con Task
+
+    def set_password(self, password):
+        self.password_hash = generate_password_hash(password)
+
+    def check_password(self, password):
+        return check_password_hash(self.password_hash, password)
 
     def __repr__(self):
-        return f'<Task {self.id}: {self.title}>'
+        return f'<User {self.username}>'
 
-    # Método para serializar el objeto Task a un diccionario (JSON)
-    def to_dict(self):
-        return {
-            'id': self.id,
-            'title': self.title,
-            'description': self.description,
-            'completed': self.completed,
-            'created_at': self.created_at.isoformat(), # Formato ISO para fechas
-            'updated_at': self.updated_at.isoformat()
-        }
+class Task(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    title = db.Column(db.String(120), nullable=False)
+    done = db.Column(db.Boolean, default=False)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True) # Permite NULL para tareas pre-existentes
+    created_at = db.Column(db.DateTime, default=db.func.now())
 
-# --- 3. Rutas de la API (Endpoints CRUD) ---
+    def __repr__(self):
+        return f'<Task {self.title}>'
 
-# Ruta para crear una nueva tarea (CREATE)
-@app.route('/tasks', methods=['POST'])
-def create_task():
+# --- Rutas de Autenticación ---
+
+@app.route('/register', methods=['POST'])
+def register():
     data = request.get_json()
-    if not data or not 'title' in data:
-        return jsonify({"error": "Title is required"}), 400
+    username = data.get('username')
+    password = data.get('password')
 
-    new_task = Task(
-        title=data['title'],
-        description=data.get('description'), # .get() para que no sea obligatorio
-        completed=data.get('completed', False)
-    )
+    if not username or not password:
+        return jsonify({"msg": "Username and password are required"}), 400
+
+    if User.query.filter_by(username=username).first():
+        return jsonify({"msg": "User already exists"}), 409
+
+    new_user = User(username=username)
+    new_user.set_password(password) # Usa el método set_password para hashear
+    db.session.add(new_user)
+    db.session.commit()
+
+    return jsonify({"msg": "User registered successfully"}), 201
+
+@app.route('/login', methods=['POST'])
+def login():
+    data = request.get_json()
+    username = data.get('username')
+    password = data.get('password')
+
+    user = User.query.filter_by(username=username).first()
+
+    if user is None or not user.check_password(password):
+        return jsonify({"msg": "Bad username or password"}), 401
+
+    access_token = create_access_token(identity=str(user.id)) # Crea el token JWT
+    return jsonify(access_token=access_token), 200
+
+# --- Rutas de Tareas (Protegidas por JWT) ---
+
+@app.route('/tasks', methods=['GET'])
+@jwt_required() # Requiere un token JWT válido
+def get_tasks():
+    current_user_id = get_jwt_identity() # Obtiene el ID del usuario del token JWT
+    tasks = Task.query.filter_by(user_id=current_user_id).all() # Filtra tareas por el ID del usuario logueado
+    output = []
+    for task in tasks:
+        task_data = {'id': task.id, 'title': task.title, 'done': task.done, 'user_id': task.user_id}
+        output.append(task_data)
+    return jsonify(output)
+
+@app.route('/tasks', methods=['POST'])
+@jwt_required() # Requiere un token JWT válido
+def add_task():
+    current_user_id = get_jwt_identity() # Obtiene el ID del usuario del token JWT
+    data = request.get_json()
+    title = data.get('title')
+
+    if not title:
+        return jsonify({"msg": "Title is required"}), 400
+
+    new_task = Task(title=title, user_id=current_user_id) # Asigna la tarea al usuario actual
     db.session.add(new_task)
     db.session.commit()
-    return jsonify(new_task.to_dict()), 201 # 201 Created
+    return jsonify({"msg": "Task added successfully", "id": new_task.id, "title": new_task.title, "done": new_task.done, "user_id": new_task.user_id}), 201
 
-# Ruta para obtener todas las tareas (READ ALL)
-@app.route('/tasks', methods=['GET'])
-def get_tasks():
-    tasks = Task.query.all()
-    return jsonify([task.to_dict() for task in tasks])
-
-# Ruta para obtener una sola tarea por ID (READ ONE)
-@app.route('/tasks/<int:task_id>', methods=['GET'])
-def get_task(task_id):
-    task = Task.query.get_or_404(task_id) # get_or_404 para manejar si no existe
-    return jsonify(task.to_dict())
-
-# Ruta para actualizar una tarea existente (UPDATE)
 @app.route('/tasks/<int:task_id>', methods=['PUT'])
+@jwt_required() # Requiere un token JWT válido
 def update_task(task_id):
-    task = Task.query.get_or_404(task_id)
+    current_user_id = get_jwt_identity() # Obtiene el ID del usuario del token JWT
+    # Busca la tarea por ID y asegúrate de que pertenezca al usuario actual
+    task = Task.query.filter_by(id=task_id, user_id=current_user_id).first()
+
+    if not task:
+        return jsonify({"msg": "Task not found or you don't have permission"}), 404
+
     data = request.get_json()
-
-    if 'title' in data:
-        task.title = data['title']
-    if 'description' in data:
-        task.description = data['description']
-    if 'completed' in data:
-        task.completed = data['completed']
-
+    task.title = data.get('title', task.title)
+    task.done = data.get('done', task.done)
     db.session.commit()
-    return jsonify(task.to_dict())
+    return jsonify({"msg": "Task updated successfully", "id": task.id, "title": task.title, "done": task.done, "user_id": task.user_id})
 
-# Ruta para eliminar una tarea (DELETE)
 @app.route('/tasks/<int:task_id>', methods=['DELETE'])
+@jwt_required() # Requiere un token JWT válido
 def delete_task(task_id):
-    task = Task.query.get_or_404(task_id)
+    current_user_id = get_jwt_identity() # Obtiene el ID del usuario del token JWT
+    # Busca la tarea por ID y asegúrate de que pertenezca al usuario actual
+    task = Task.query.filter_by(id=task_id, user_id=current_user_id).first()
+
+    if not task:
+        return jsonify({"msg": "Task not found or you don't have permission"}), 404
+
     db.session.delete(task)
     db.session.commit()
-    return jsonify({"message": "Task deleted successfully"}), 204 # 204 No Content
+    return jsonify({"msg": "Task deleted successfully"})
 
-# --- 4. Inicialización de la Base de Datos (Crear Tablas) ---
-@app.cli.command('create-db')
-def create_db_command():
-    """Crea las tablas de la base de datos."""
-    with app.app_context():
-        db.create_all()
-        print("Base de datos y tablas creadas!")
-
-# --- 5. Ejecución de la aplicación ---
 if __name__ == '__main__':
-    app.run(debug=True) # debug=True para desarrollo (recarga automática y errores detallados)
+    app.run(debug=True)
